@@ -18,6 +18,11 @@ import shlex
 import sys
 import time
 import traceback
+
+from werkzeug.test import EnvironBuilder
+import werkzeug.wrappers
+
+
 try:                    # Python 3
     import configparser
     from threading import current_thread
@@ -28,7 +33,7 @@ try:                    # Python 3
 except ImportError:     # Python 2
     import ConfigParser as configparser
     from threading import currentThread as current_thread
-    from xmlrpclib import Fault, ServerProxy
+    from xmlrpclib import Fault, ServerProxy, Transport
     int_types = int, long
 
     class _DictWriter(csv.DictWriter):
@@ -317,6 +322,24 @@ class Error(Exception):
     """An ERPpeek error."""
 
 
+class SessionTransport(Transport):
+
+    _server = None
+
+    def __init__(self, *args, **kwargs):
+        self._server = kwargs.pop('server', None)
+        res = super(SessionTransport, self).__init__(*args, **kwargs)
+
+    def send_content(self, connection, request_body):
+        if self._server:
+            session_id = self._server._session_id
+            if session_id:
+                connection.putheader("Cookie", "session_id=%s" % session_id)
+                connection.endheaders()
+        if request_body:
+            connection.send(request_body)
+
+
 class Service(object):
     """A wrapper around XML-RPC endpoints.
 
@@ -329,11 +352,16 @@ class Service(object):
     instance to list them.
     """
     _rpcpath = ''
+    _session_id = False
 
-    def __init__(self, server, endpoint, methods, verbose=False):
+    def __init__(self, server, endpoint, methods, verbose=False,
+                 session_id=None):
+        self._session_id = session_id
         if isinstance(server, basestring):
             self._rpcpath = rpcpath = server + '/xmlrpc/'
-            proxy = ServerProxy(rpcpath + endpoint, allow_none=True)
+            proxy = ServerProxy(rpcpath + endpoint,
+                                allow_none=True,
+                                transport=SessionTransport(server=self))
             self._dispatch = proxy._ServerProxy__request
             if hasattr(proxy._ServerProxy__transport, 'close'):   # >= 2.7
                 self.close = proxy._ServerProxy__transport.close
@@ -341,8 +369,8 @@ class Service(object):
             proxy = server.netsvc.ExportService.getService(endpoint)
             self._dispatch = proxy.dispatch
         else:   # Odoo v8
-            self._dispatch = functools.partial(server.http.dispatch_rpc,
-                                               endpoint)
+            self._dispatch = functools.partial(
+                self._dispatch_memory, server, endpoint)
         self._endpoint = endpoint
         self._methods = methods
         self._verbose = verbose
@@ -388,6 +416,20 @@ class Service(object):
         if hasattr(self, 'close'):
             self.close()
 
+    def _dispatch_memory(self, odoo, endpoint, method, params):
+        sid = self._session_id
+        if odoo and sid:
+            builder = EnvironBuilder(
+                method='POST',
+                headers={'HTTP_COOKIE': 'session_id=%s' % sid})
+            httprequest = werkzeug.wrappers.Request(builder.get_environ())
+            httprequest.session = odoo.http.root.session_store.get(sid)
+            with odoo.http.WebRequest(httprequest):
+                res = odoo.http.dispatch_rpc(endpoint, method, params)
+        else:
+            res = odoo.http.dispatch_rpc(endpoint, method, params)
+        return res
+
 
 class Client(object):
     """Connection to an Odoo instance.
@@ -402,6 +444,7 @@ class Client(object):
     asked on login.
     """
     _config_file = os.path.join(os.curdir, CONF_FILE)
+    _session_id = None
 
     def __init__(self, server, db=None, user=None, password=None,
                  verbose=False):
@@ -411,27 +454,34 @@ class Client(object):
             appname = os.path.basename(__file__).rstrip('co')
             server = start_odoo_services(server, appname=appname)
         self._server = server
-        float_version = 999
-
-        def get_proxy(name):
-            methods = list(_methods[name]) if (name in _methods) else []
-            if float_version < 8.0:
-                methods += _obsolete_methods.get(name) or ()
-            return Service(server, name, methods, verbose=verbose)
-        self.server_version = ver = get_proxy('db').server_version()
-        self.major_version = re.match('\d+\.?\d*', ver).group()
-        float_version = float(self.major_version)
-        # Create the XML-RPC proxies
-        self.db = get_proxy('db')
-        self.common = get_proxy('common')
-        self._object = get_proxy('object')
-        self._report = get_proxy('report')
-        self._wizard = get_proxy('wizard') if float_version < 7.0 else None
+        self._verbose = verbose
+        self.create_proxies()
+        # self._odoo_rpc = self.get_json_rpc()
+         #TODO: Update params
         self.reset()
         self.context = None
         if db:
             # Try to login
             self.login(user, password=password, database=db)
+
+    def create_proxies(self):
+        """ Create the XML-RPC proxies """
+
+        def get_proxy(name):
+            methods = list(_methods[name]) if (name in _methods) else []
+            if float_version < 8.0:
+                methods += _obsolete_methods.get(name) or ()
+            return Service(self._server, name, methods, verbose=self._verbose, session_id=self._session_id)
+
+        float_version = 999
+        self.server_version = ver = get_proxy('db').server_version()
+        self.major_version = re.match('\d+\.?\d*', ver).group()
+        float_version = float(self.major_version)
+        self.db = get_proxy('db')
+        self.common = get_proxy('common')
+        self._object = get_proxy('object')
+        self._report = get_proxy('report')
+        self._wizard = get_proxy('wizard') if float_version < 7.0 else None
 
     @classmethod
     def from_config(cls, environment, user=None, verbose=False):
@@ -457,7 +507,7 @@ class Client(object):
     def __repr__(self):
         return "<Client '%s#%s'>" % (self._server or '', self._db)
 
-    def login(self, user, password=None, database=None):
+    def login(self, user, password=None, database=None, session_id=None):
         """Switch `user` and (optionally) `database`.
 
         If the `password` is not available, it will be asked.
@@ -479,7 +529,8 @@ class Client(object):
             database = self._db
         else:
             raise Error('Not connected')
-        (uid, password) = self._auth(database, user, password)
+        (uid, password, session_id) = self._auth(
+            database, user, password, session_id=session_id)
         if not uid:
             current_thread().dbname = self._db
             raise Error('Invalid username or password')
@@ -487,6 +538,8 @@ class Client(object):
             self.reset()
             self._db = database
         self.user = user
+        self._session_id = session_id
+        self.create_proxies()
 
         # Authenticated endpoints
         def authenticated(method):
@@ -508,6 +561,7 @@ class Client(object):
     connect = None
     _login = login
     _login.cache = {}
+    _login.sessions_cache = {}
 
     def _check_valid(self, database, uid, password):
         execute = self._object.execute
@@ -517,7 +571,21 @@ class Client(object):
         except Fault:
             return False
 
-    def _auth(self, database, user, password):
+    def _check_valid_session(self, database, uid, session_id):
+        odoo = self._odoorpc
+        data = odoo._connector.proxy_json._opener.addheaders.append(
+            ('Cookie', 'session_id=%s' % session_id))
+        try:
+            result = data['result']
+            assert result['session_id'] == session_id
+            assert result['db'] == database
+            assert result['uid'] == uid
+            is_valid = True
+        except:
+            is_valid = False
+        return is_valid
+
+    def _auth(self, database, user, password, session_id=None):
         assert database
         cache_key = (self._server, database, user)
         if password:
@@ -537,10 +605,19 @@ class Client(object):
                 else:
                     # Invalid user
                     uid = False
+            # Read session from cache
+            uid2, session_id = self._login.sessions_cache[cache_key]
+            assert uid == uid2, "the session_id belongs to another user: %s" % uid2
             # Ask for password
             if not password and uid is not False:
                 from getpass import getpass
                 password = getpass('Password for %r: ' % user)
+        # if uid:
+        #     # Check if session has expired
+        #     if not self._check_valid_session(database, uid, session_id):
+        #         if cache_key in self._login.cache:
+        #             del self.sessions_cache[cache_key]
+        #         uid = False
         if uid:
             # Check if password changed
             if not self._check_valid(database, uid, password):
@@ -548,12 +625,34 @@ class Client(object):
                     del self._login.cache[cache_key]
                 uid = False
         elif uid is None:
-            # Do a standard 'login'
-            uid = self.common.login(database, user, password)
+            (uid, session_id) = self._auth_session(database, user, password, uid)
         if uid:
             # Update the cache
             self._login.cache[cache_key] = (uid, password)
-        return (uid, password)
+            self._login.sessions_cache[cache_key] = (uid, session_id)
+        return (uid, password, session_id)
+
+    def _auth_session(self, db, login, password, uid):
+        ''' Alternate implementation of session.authenticate without request'''
+        # like: https://github.com/OCA/OCB/blob/d66f7cb247b5dad483f9061a038c5d22e7313b0f/odoo/tests/common.py#L274
+
+        odoo = self._server
+        security = odoo.service.security
+        session = odoo.http.root.session_store.new()
+        # session.authenticate(db, login=login, password=password, uid=uid)
+        if uid is None:
+            # Do a standard 'login'
+            uid = self.common.login(db, login, password)
+        else:
+            security.check(db, uid, password)
+        session.db = db
+        session.uid = uid
+        session.login = login
+        session.password = password
+        # if uid:
+        #     session.get_context()
+        odoo.http.root.session_store.save(session)
+        return (uid, session.sid)
 
     @classmethod
     def _set_interactive(cls, global_vars={}):
